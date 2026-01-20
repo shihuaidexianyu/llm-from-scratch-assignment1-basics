@@ -402,6 +402,11 @@ class BPETokenizer:
                 merges.append((rw_helper.decode_token_str(token1), rw_helper.decode_token_str(token2)))
         return cls(vocab, merges, special_tokens)
 
+    def save(
+        self, out_dir: Path, vocab_filename: str = "tokenizer_vocab.json", merges_filename: str = "tokenizer_merges.txt"
+    ) -> tuple[Path, Path]:
+        return save_tokenizer(self.vocab, self.merges, out_dir, vocab_filename, merges_filename)
+
     @staticmethod
     def _get_pairs(token_ids: tuple[int, ...]) -> set[tuple[int, int]]:
         pairs = set()
