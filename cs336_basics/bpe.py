@@ -305,29 +305,32 @@ def train_bpe(
     return vocab, merges
 
 
-def _bytes_to_unicode() -> dict[int, str]:
-    """
-    把 0–255 的每个字节映射成一个“可打印、可存到 JSON 的 Unicode 字符
-    参考 GPT-2 的实现
-    这样做是为了确保分词后的 token 可以直接作为字符串存储和处理
-    例如，字节 0 映射为 Unicode 字符 '\u0100'，字节 255 映射为 '\u01ff'。
-    这样就避免了控制字符和不可打印字符的问题。
-    该映射是双向的，可以通过反向映射将 Unicode 字符转换回原始字节。
-    该函数返回一个字典，键是字节，值是对应的 Unicode 字符。
-    """
-    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
-    cs = bs[:]
-    n = 0
-    for b in range(2**8):
-        if b not in bs:
-            bs.append(b)
-            cs.append(2**8 + n)
-            n += 1
-    return dict(zip(bs, [chr(n) for n in cs]))
-
-
 class RWHelper:
     def __init__(self):
+        def _bytes_to_unicode() -> dict[int, str]:
+            """
+            把 0–255 的每个字节映射成一个“可打印、可存到 JSON 的 Unicode 字符
+            参考 GPT-2 的实现
+            这样做是为了确保分词后的 token 可以直接作为字符串存储和处理
+            例如，字节 0 映射为 Unicode 字符 '\u0100'，字节 255 映射为 '\u01ff'。
+            这样就避免了控制字符和不可打印字符的问题。
+            该映射是双向的，可以通过反向映射将 Unicode 字符转换回原始字节。
+            该函数返回一个字典，键是字节，值是对应的 Unicode 字符。
+            """
+            bs = (
+                list(range(ord("!"), ord("~") + 1))
+                + list(range(ord("¡"), ord("¬") + 1))
+                + list(range(ord("®"), ord("ÿ") + 1))
+            )
+            cs = bs[:]
+            n = 0
+            for b in range(2**8):
+                if b not in bs:
+                    bs.append(b)
+                    cs.append(2**8 + n)
+                    n += 1
+            return dict(zip(bs, [chr(n) for n in cs]))
+
         self.byte_encoder = _bytes_to_unicode()
         self.byte_decoder = {v: k for k, v in self.byte_encoder.items()}
 
