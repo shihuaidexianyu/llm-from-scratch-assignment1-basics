@@ -125,29 +125,10 @@ def _process_chunk_worker(args) -> collections.Counter:
     return local_counts
 
 
-def _iter_non_special_segments(text: str, special_tokens: list[str]) -> list[str]:
-    if not special_tokens:
-        return [text] if text else []
-    tokens = sorted(set(special_tokens), key=len, reverse=True)
-    # 过滤空 token，避免问题
-    tokens = [t for t in tokens if t]
-    if not tokens:
-        return [text] if text else []
-    pattern = "|".join(re.escape(t) for t in tokens)
-    regex = re.compile(pattern)
-    segments = []
-    last_end = 0
-    for match in regex.finditer(text):
-        if match.start() > last_end:
-            segments.append(text[last_end : match.start()])
-        last_end = match.end()
-    if last_end < len(text):
-        segments.append(text[last_end:])
-    return segments
-
-
 def _split_text_with_special_tokens(text: str, special_tokens: list[str]) -> list[tuple[str, bool]]:
-    """Split text into (segment, is_special) while preserving special tokens."""
+    """
+    切分文本为 (segment, is_special) 列表，同时保留特殊 token 信息。
+    """
     if not special_tokens:
         return [(text, False)] if text else []
     tokens = sorted(set(special_tokens), key=len, reverse=True)
@@ -181,7 +162,7 @@ def pretokenize_text(text: str, special_tokens: list[str] | None = None) -> list
         if is_special:
             tokens.append(tuple(segment.encode("utf-8")))
             continue
-        # 正则切分
+        # 对于非特殊段做正则切分
         subtokens = re.findall(GPT2_PAT, segment)
         for token in subtokens:
             tokens.append(tuple(token.encode("utf-8")))
@@ -325,6 +306,15 @@ def train_bpe(
 
 
 def _bytes_to_unicode() -> dict[int, str]:
+    """
+    把 0–255 的每个字节映射成一个“可打印、可存到 JSON 的 Unicode 字符
+    参考 GPT-2 的实现
+    这样做是为了确保分词后的 token 可以直接作为字符串存储和处理
+    例如，字节 0 映射为 Unicode 字符 '\u0100'，字节 255 映射为 '\u01ff'。
+    这样就避免了控制字符和不可打印字符的问题。
+    该映射是双向的，可以通过反向映射将 Unicode 字符转换回原始字节。
+    该函数返回一个字典，键是字节，值是对应的 Unicode 字符。
+    """
     bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
     cs = bs[:]
     n = 0
@@ -459,6 +449,8 @@ class BPETokenizer:
                 token_id = self.token_to_id[bytes(token_bytes)]
                 mapped_tokens.append((token_id,))
                 continue
+            # 将每个字节映射为对应的 token ID
+            # 例如 b"Hello" -> (72, 101, 108, 108, 111) -> (id(72), id(101), id(108), id(108), id(111))
             mapped_tokens.append(tuple(self.token_to_id[bytes([b])] for b in token_bytes))
         bpe_tokens = self._apply_merges(mapped_tokens)
         # 展平为单一 ID 列表
