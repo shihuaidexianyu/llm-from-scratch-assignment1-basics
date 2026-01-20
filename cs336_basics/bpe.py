@@ -3,7 +3,8 @@ import json
 import multiprocessing
 import collections
 from pathlib import Path
-from typing import BinaryIO, Iterable, Iterator
+from typing import BinaryIO
+from collections.abc import Iterable, Iterator
 
 
 def _find_chunk_boundaries(
@@ -91,6 +92,7 @@ def _process_chunk_worker(args) -> collections.Counter:
     """
     filename, start, end, special_tokens = args
     local_counts = collections.Counter()
+    special_token_ids = {token: 256 + i for i, token in enumerate(special_tokens or [])}
 
     # "Pre-tokenization" 步骤
     try:
@@ -103,7 +105,11 @@ def _process_chunk_worker(args) -> collections.Counter:
                 if not segment:
                     continue
                 if is_special:
-                    local_counts[tuple(segment.encode("utf-8"))] += 1
+                    token_id = special_token_ids.get(segment)
+                    if token_id is not None:
+                        local_counts[(token_id,)] += 1
+                    else:
+                        local_counts[tuple(segment.encode("utf-8"))] += 1
                     continue
                 # 正则切分,注意这一步在保留特殊 token 之后进行,否则会把特殊 token 切碎
                 tokens = re.findall(GPT2_PAT, segment)
@@ -371,6 +377,7 @@ class BPETokenizer:
         self.token_to_id = {v: k for k, v in vocab.items()}
         self.bpe_ranks = {(self.token_to_id[a], self.token_to_id[b]): i for i, (a, b) in enumerate(merges)}
         self.special_tokens_ids = set(self.token_to_id[token.encode("utf-8")] for token in self.special_tokens)
+        self.special_tokens_bytes = {tuple(token.encode("utf-8")) for token in self.special_tokens}
 
     @classmethod
     def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
@@ -444,7 +451,16 @@ class BPETokenizer:
 
     def encode(self, text: str) -> list[int]:
         pretokens = pretokenize_text(text, self.special_tokens)
-        bpe_tokens = self._apply_merges(pretokens)
+        mapped_tokens: list[tuple[int, ...]] = []
+        for token_bytes in pretokens:
+            if not token_bytes:
+                continue
+            if token_bytes in self.special_tokens_bytes:
+                token_id = self.token_to_id[bytes(token_bytes)]
+                mapped_tokens.append((token_id,))
+                continue
+            mapped_tokens.append(tuple(self.token_to_id[bytes([b])] for b in token_bytes))
+        bpe_tokens = self._apply_merges(mapped_tokens)
         # 展平为单一 ID 列表
         flat_ids = []
         for token in bpe_tokens:
