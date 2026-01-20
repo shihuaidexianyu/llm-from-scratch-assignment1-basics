@@ -472,6 +472,10 @@ class BPETokenizer:
         return flat_ids
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        # 之前没用过 yield from 语法，补充注释说明
+        # 这里是“生成器函数”，逐条处理输入文本，逐个产出 token id
+        # iterable 可以是：列表、文件对象(逐行)、任何可迭代的字符串序列
+        # yield from 等价于：把 self.encode(text) 里的每个 id 逐个 yield 出去
         for text in iterable:
             yield from self.encode(text)
 
