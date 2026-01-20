@@ -1,7 +1,9 @@
 import os
+import json
 import multiprocessing
 import collections
-from typing import BinaryIO
+from pathlib import Path
+from typing import BinaryIO, Iterable, Iterator
 
 
 def _find_chunk_boundaries(
@@ -97,8 +99,13 @@ def _process_chunk_worker(args) -> collections.Counter:
             # 读取字节并 decode
             # errors='ignore' 防止边界处切断了多字节字符导致报错
             text = f.read(end - start).decode("utf-8", errors="ignore")
-            for segment in _iter_non_special_segments(text, special_tokens):
-                # 正则切分,注意这一步在去除特殊 token 之后进行,否则会把特殊 token 切碎
+            for segment, is_special in _split_text_with_special_tokens(text, special_tokens):
+                if not segment:
+                    continue
+                if is_special:
+                    local_counts[tuple(segment.encode("utf-8"))] += 1
+                    continue
+                # 正则切分,注意这一步在保留特殊 token 之后进行,否则会把特殊 token 切碎
                 tokens = re.findall(GPT2_PAT, segment)
                 # 转换为字节元组并统计
                 # 例如: "Hello" -> b"Hello" -> (72, 101, 108, 108, 111)
@@ -131,6 +138,48 @@ def _iter_non_special_segments(text: str, special_tokens: list[str]) -> list[str
     if last_end < len(text):
         segments.append(text[last_end:])
     return segments
+
+
+def _split_text_with_special_tokens(text: str, special_tokens: list[str]) -> list[tuple[str, bool]]:
+    """Split text into (segment, is_special) while preserving special tokens."""
+    if not special_tokens:
+        return [(text, False)] if text else []
+    tokens = sorted(set(special_tokens), key=len, reverse=True)
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return [(text, False)] if text else []
+    pattern = "|".join(re.escape(t) for t in tokens)
+    regex = re.compile(pattern)
+    segments: list[tuple[str, bool]] = []
+    last_end = 0
+    for match in regex.finditer(text):
+        if match.start() > last_end:
+            segments.append((text[last_end : match.start()], False))
+        segments.append((match.group(0), True))
+        last_end = match.end()
+    if last_end < len(text):
+        segments.append((text[last_end:], False))
+    return segments
+
+
+def pretokenize_text(text: str, special_tokens: list[str] | None = None) -> list[tuple[int, ...]]:
+    """
+    对输入文本进行预分词，返回字节 token 列表。
+    """
+    special_tokens = special_tokens or []
+    segments = _split_text_with_special_tokens(text, special_tokens)
+    tokens: list[tuple[int, ...]] = []
+    for segment, is_special in segments:
+        if not segment:
+            continue
+        if is_special:
+            tokens.append(tuple(segment.encode("utf-8")))
+            continue
+        # 正则切分
+        subtokens = re.findall(GPT2_PAT, segment)
+        for token in subtokens:
+            tokens.append(tuple(token.encode("utf-8")))
+    return tokens
 
 
 def get_stats(vocab_counts: dict[tuple[int, ...], int]) -> dict[tuple[int, int], int]:
@@ -267,3 +316,151 @@ def train_bpe(
 
         current_token_id += 1
     return vocab, merges
+
+
+def _bytes_to_unicode() -> dict[int, str]:
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+    cs = bs[:]
+    n = 0
+    for b in range(2**8):
+        if b not in bs:
+            bs.append(b)
+            cs.append(2**8 + n)
+            n += 1
+    return dict(zip(bs, [chr(n) for n in cs]))
+
+
+def _encode_token_bytes(token_bytes: bytes, byte_encoder: dict[int, str]) -> str:
+    return "".join(byte_encoder[b] for b in token_bytes)
+
+
+def save_tokenizer(
+    vocab: dict[int, bytes],
+    merges: list[tuple[bytes, bytes]],
+    out_dir: Path,
+    vocab_filename: str = "tokenizer_vocab.json",
+    merges_filename: str = "tokenizer_merges.txt",
+) -> tuple[Path, Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    byte_encoder = _bytes_to_unicode()
+
+    vocab_out = {_encode_token_bytes(token_bytes, byte_encoder): token_id for token_id, token_bytes in vocab.items()}
+    vocab_path = out_dir / vocab_filename
+    with vocab_path.open("w", encoding="utf-8") as f:
+        json.dump(vocab_out, f, ensure_ascii=False, indent=2)
+
+    merges_path = out_dir / merges_filename
+    with merges_path.open("w", encoding="utf-8") as f:
+        for token_a, token_b in merges:
+            token_a_str = _encode_token_bytes(token_a, byte_encoder)
+            token_b_str = _encode_token_bytes(token_b, byte_encoder)
+            f.write(f"{token_a_str} {token_b_str}\n")
+
+    return vocab_path, merges_path
+
+
+class BPETokenizer:
+    def __init__(
+        self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None
+    ):
+        # str--->bytes--->int
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens or []
+        # 构建反向词表和合并规则映射
+        self.token_to_id = {v: k for k, v in vocab.items()}
+        self.bpe_ranks = {(self.token_to_id[a], self.token_to_id[b]): i for i, (a, b) in enumerate(merges)}
+        self.special_tokens_ids = set(self.token_to_id[token.encode("utf-8")] for token in self.special_tokens)
+
+    @classmethod
+    def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
+        vocab = {}  # dict[int, bytes]
+        special_tokens = special_tokens or []
+        byte_decoder = {v: k for k, v in _bytes_to_unicode().items()}
+
+        def _decode_token_str(token_str: str) -> bytes:
+            return bytes(byte_decoder[ch] for ch in token_str)
+
+        # 词表是json文件
+        # 存放的是 str -> int 映射
+        with open(vocab_filepath, encoding="utf-8") as vf:
+            vocab_json = json.load(vf)
+            for token_str, token_id in vocab_json.items():
+                token_id = int(token_id)
+                token_bytes = _decode_token_str(token_str)
+                vocab[token_id] = token_bytes
+        merges = []
+        # merges 是txt文件
+        # 存放是 bytes 对形式
+        with open(merges_filepath, encoding="utf-8") as mf:
+            for line in mf:
+                token1, token2 = line.strip().split()
+                merges.append((_decode_token_str(token1), _decode_token_str(token2)))
+        return cls(vocab, merges, special_tokens)
+
+    @staticmethod
+    def _get_pairs(token_ids: tuple[int, ...]) -> set[tuple[int, int]]:
+        pairs = set()
+        if len(token_ids) < 2:
+            return pairs
+        prev_id = token_ids[0]
+        for curr_id in token_ids[1:]:
+            pairs.add((prev_id, curr_id))
+            prev_id = curr_id
+        return pairs
+
+    def _apply_merges(self, token_ids: list[tuple[int, ...]]) -> list[tuple[int, ...]]:
+        merged_tokens: list[tuple[int, ...]] = []
+        for token in token_ids:
+            # 如果是特殊 token，直接跳过
+            if len(token) == 1 and token[0] in self.special_tokens_ids:
+                merged_tokens.append(token)
+                continue
+            pairs = self._get_pairs(token)
+            while True:
+                # 找到当前 token 中排名最高的 pair
+                best_pair = min(
+                    (pair for pair in pairs if pair in self.bpe_ranks),
+                    key=lambda p: self.bpe_ranks[p],
+                    default=None,
+                )
+                if best_pair is None:
+                    break
+                # 合并 best_pair
+                new_token = []
+                i = 0
+                p0, p1 = best_pair
+                while i < len(token):
+                    if i < len(token) - 1 and token[i] == p0 and token[i + 1] == p1:
+                        new_token.append(self.token_to_id[self.vocab[p0] + self.vocab[p1]])  # 合并为新token
+                        i += 2
+                    else:
+                        new_token.append(token[i])
+                        i += 1
+                token = tuple(new_token)
+                pairs = self._get_pairs(token)
+            merged_tokens.append(token)
+        return merged_tokens
+
+    def encode(self, text: str) -> list[int]:
+        pretokens = pretokenize_text(text, self.special_tokens)
+        bpe_tokens = self._apply_merges(pretokens)
+        # 展平为单一 ID 列表
+        flat_ids = []
+        for token in bpe_tokens:
+            flat_ids.extend(token)
+        return flat_ids
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        for text in iterable:
+            yield from self.encode(text)
+
+    def decode(self, ids: list[int]) -> str:
+        bytes_chunks = []
+        for token_id in ids:
+            token_bytes = self.vocab.get(token_id, b"")
+            bytes_chunks.append(token_bytes)
+        text_bytes = b"".join(bytes_chunks)
+        # 解码 bytes 为 str
+        text = text_bytes.decode("utf-8", errors="ignore")
+        return text
