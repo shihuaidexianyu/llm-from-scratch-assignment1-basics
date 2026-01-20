@@ -326,8 +326,17 @@ def _bytes_to_unicode() -> dict[int, str]:
     return dict(zip(bs, [chr(n) for n in cs]))
 
 
-def _encode_token_bytes(token_bytes: bytes, byte_encoder: dict[int, str]) -> str:
-    return "".join(byte_encoder[b] for b in token_bytes)
+class RWHelper:
+    def __init__(self):
+        self.byte_encoder = _bytes_to_unicode()
+        self.byte_decoder = {v: k for k, v in self.byte_encoder.items()}
+
+    def encode_token_bytes(self, token_bytes: bytes) -> str:
+        """"""
+        return "".join(self.byte_encoder[b] for b in token_bytes)
+
+    def decode_token_str(self, token_str: str) -> bytes:
+        return bytes(self.byte_decoder[ch] for ch in token_str)
 
 
 def save_tokenizer(
@@ -338,9 +347,8 @@ def save_tokenizer(
     merges_filename: str = "tokenizer_merges.txt",
 ) -> tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    byte_encoder = _bytes_to_unicode()
-
-    vocab_out = {_encode_token_bytes(token_bytes, byte_encoder): token_id for token_id, token_bytes in vocab.items()}
+    rw_helper = RWHelper()
+    vocab_out = {rw_helper.encode_token_bytes(token_bytes): token_id for token_id, token_bytes in vocab.items()}
     vocab_path = out_dir / vocab_filename
     with vocab_path.open("w", encoding="utf-8") as f:
         json.dump(vocab_out, f, ensure_ascii=False, indent=2)
@@ -348,8 +356,8 @@ def save_tokenizer(
     merges_path = out_dir / merges_filename
     with merges_path.open("w", encoding="utf-8") as f:
         for token_a, token_b in merges:
-            token_a_str = _encode_token_bytes(token_a, byte_encoder)
-            token_b_str = _encode_token_bytes(token_b, byte_encoder)
+            token_a_str = rw_helper.encode_token_bytes(token_a)
+            token_b_str = rw_helper.encode_token_bytes(token_b)
             f.write(f"{token_a_str} {token_b_str}\n")
 
     return vocab_path, merges_path
@@ -373,18 +381,14 @@ class BPETokenizer:
     def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None):
         vocab = {}  # dict[int, bytes]
         special_tokens = special_tokens or []
-        byte_decoder = {v: k for k, v in _bytes_to_unicode().items()}
-
-        def _decode_token_str(token_str: str) -> bytes:
-            return bytes(byte_decoder[ch] for ch in token_str)
-
+        rw_helper = RWHelper()
         # 词表是json文件
         # 存放的是 str -> int 映射
         with open(vocab_filepath, encoding="utf-8") as vf:
             vocab_json = json.load(vf)
             for token_str, token_id in vocab_json.items():
                 token_id = int(token_id)
-                token_bytes = _decode_token_str(token_str)
+                token_bytes = rw_helper.decode_token_str(token_str)
                 vocab[token_id] = token_bytes
         merges = []
         # merges 是txt文件
@@ -392,7 +396,7 @@ class BPETokenizer:
         with open(merges_filepath, encoding="utf-8") as mf:
             for line in mf:
                 token1, token2 = line.strip().split()
-                merges.append((_decode_token_str(token1), _decode_token_str(token2)))
+                merges.append((rw_helper.decode_token_str(token1), rw_helper.decode_token_str(token2)))
         return cls(vocab, merges, special_tokens)
 
     @staticmethod
