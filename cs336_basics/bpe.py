@@ -345,10 +345,11 @@ class RWHelper:
 def save_tokenizer(
     vocab: dict[int, bytes],
     merges: list[tuple[bytes, bytes]],
-    out_dir: Path,
+    out_dir: str | os.PathLike | Path,
     vocab_filename: str = "tokenizer_vocab.json",
     merges_filename: str = "tokenizer_merges.txt",
 ) -> tuple[Path, Path]:
+    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     rw_helper = RWHelper()
     vocab_out = {rw_helper.encode_token_bytes(token_bytes): token_id for token_id, token_bytes in vocab.items()}
@@ -403,7 +404,10 @@ class BPETokenizer:
         return cls(vocab, merges, special_tokens)
 
     def save(
-        self, out_dir: Path, vocab_filename: str = "tokenizer_vocab.json", merges_filename: str = "tokenizer_merges.txt"
+        self,
+        out_dir: str | os.PathLike | Path,
+        vocab_filename: str = "tokenizer_vocab.json",
+        merges_filename: str = "tokenizer_merges.txt",
     ) -> tuple[Path, Path]:
         return save_tokenizer(self.vocab, self.merges, out_dir, vocab_filename, merges_filename)
 
