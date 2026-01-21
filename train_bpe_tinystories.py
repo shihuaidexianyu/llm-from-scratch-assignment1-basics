@@ -37,4 +37,12 @@ if __name__ == "__main__":
         Signals delivered: 0
         Page size (bytes): 4096
         Exit status: 0
+
+the longest tokens are: 
+
+Ġaccomplishment
+Ġdisappointment
+Ġresponsibility
+
+their lengths area all 15.
 """
