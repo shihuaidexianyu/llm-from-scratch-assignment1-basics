@@ -20,6 +20,9 @@ class RotaryPositionalEmbedding(nn.Module):
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
         # x: (Batch, Seq, Dim)
 
+        # token_positions: (Batch, Seq)
+        # inv_freq: (Dim/2,)
+
         # 1. 计算频率 (逻辑不变)
         # 注意：这里需要确保维度对齐，einsum 写法最稳
         # freqs: (Batch, Seq, Dim/2)
