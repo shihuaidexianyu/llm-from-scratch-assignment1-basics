@@ -9,7 +9,7 @@ if __name__ == "__main__":
     merges_filename = "bpe_merges.txt"
     vocab_filename = "bpe_vocab.json"
     out_dir = "models/tinystories_train_tokenizer"
-    vocab, merges = bpe.train_bpe(input_file, vocab_size, special_tokens, 16)
+    vocab, merges = bpe.train_bpe(input_file, vocab_size, special_tokens, 16, 16)
     bpe.save_tokenizer(vocab, merges, out_dir, vocab_filename=vocab_filename, merges_filename=merges_filename)
 
 """
