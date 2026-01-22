@@ -3,7 +3,8 @@ import torch.nn as nn
 
 
 class RotaryPositionalEmbedding(nn.Module):
-    def __init__(self, theta: float, d_k: int, max_seq_len: int, device=torch.device | None):
+    # 类型是 torch.device | None
+    def __init__(self, theta: float, d_k: int, max_seq_len: int, device: torch.device | None = None):
         super().__init__()
         self.dim = d_k
         self.theta = theta
