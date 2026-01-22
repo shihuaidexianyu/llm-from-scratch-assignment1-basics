@@ -210,101 +210,6 @@ def merge_vocab(
     return new_vocab
 
 
-def train_bpe(
-    input_path: str,
-    vocab_size: int,
-    special_tokens: list[str] | None = None,
-    num_workers: int = 4,
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """Given the path to an input corpus, run train a BPE tokenizer and
-    output its vocabulary and merges.
-
-    Args:
-        input_path (str | os.PathLike): Path to BPE tokenizer training data.
-        vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
-        special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
-            These strings will never be split into multiple tokens, and will always be
-            kept as a single token. If these special tokens occur in the `input_path`,
-            they are treated as any other string.
-
-    Returns:
-        tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-            vocab:
-                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
-                to bytes (token bytes)
-            merges:
-                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
-                representing that <token1> was merged with <token2>.
-                Merges are ordered by order of creation.
-    """
-    # 计算分块边界
-    # 假设特殊 token 是 <|endoftext|>，如果不包含，可以传空 bytes 或其他
-    special_tokens = special_tokens or []
-    split_token = special_tokens[0].encode("utf-8") if special_tokens else b""
-    boundaries = find_chunk_boundaries(input_path, num_workers, split_token)
-    # 准备参数 [(file, start, end), (file, start, end), ...]
-    chunk_args = []
-    for i in range(len(boundaries) - 1):
-        chunk_args.append((input_path, boundaries[i], boundaries[i + 1], special_tokens))
-    # 并行 Pre-tokenization (Map 阶段)
-    # 使用 multiprocessing.Pool 自动管理进程
-    global_vocab_counts = collections.Counter()
-    if num_workers > 1 and len(chunk_args) > 1:
-        with multiprocessing.Pool(processes=num_workers) as pool:
-            # imap_unordered 稍微快一点，因为我们不关心顺序
-            for local_counts in pool.imap_unordered(_process_chunk_worker, chunk_args):
-                global_vocab_counts.update(local_counts)
-    else:
-        for args in chunk_args:
-            global_vocab_counts.update(_process_chunk_worker(args))
-    # BPE 迭代 (Serial Merge 阶段)
-    # 初始 token 0-255
-    # 初始化 vocab，包含基础字节和特殊 token
-    vocab = {int(i): bytes([i]) for i in range(0, 256)}
-    merges = []
-    # 从 base_vocab_size 开始分配新 ID (避免覆盖特殊 token)
-    current_token_id = 256 + len(special_tokens)
-    # 加上特殊 token 的数量
-    base_vocab_size = 256 + len(special_tokens)
-    # 计算需要的合并次数
-    target_merges = vocab_size - base_vocab_size
-    if target_merges < 0:
-        raise ValueError("vocab_size too small for base vocabulary + special tokens")
-    # 将 Counter 转为普通 dict 以便处理，虽然 Counter 也能用但 dict 更轻量
-    vocab_counts = dict(global_vocab_counts)
-    id_to_bytes: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
-
-    for i, token in enumerate(special_tokens, start=256):
-        id_to_bytes[i] = token.encode("utf-8")
-        vocab[i] = token.encode("utf-8")
-    for i in range(target_merges):
-        # a. 统计 Pair 频率
-        pairs = get_stats(vocab_counts)
-        if not pairs:
-            break
-        # b. 找到频率最高的 Pair
-        # 按照 (频率, 字节序) 排序，保证确定性
-        best_pair = max(
-            pairs,
-            key=lambda p: (
-                pairs[p],
-                id_to_bytes[p[0]],
-                id_to_bytes[p[1]],
-            ),
-        )
-        # c. 记录合并规则（以 bytes 对形式返回）
-        merges.append((id_to_bytes[best_pair[0]], id_to_bytes[best_pair[1]]))
-        id_to_bytes[current_token_id] = id_to_bytes[best_pair[0]] + id_to_bytes[best_pair[1]]
-
-        # d. 更新词表
-        # 这一步是单线程的，但因为是在 len(vocab) 上操作，通常很快
-        vocab_counts = merge_vocab(best_pair, vocab_counts, current_token_id)
-        vocab[current_token_id] = id_to_bytes[current_token_id]
-
-        current_token_id += 1
-    return vocab, merges
-
-
 class RWHelper:
     def __init__(self):
         def _bytes_to_unicode() -> dict[int, str]:
@@ -492,3 +397,308 @@ class BPETokenizer:
         # 解码 bytes 为 str
         text = text_bytes.decode("utf-8", errors="ignore")
         return text
+
+
+class _ReverseBytes:
+    __slots__ = ("value",)
+
+    def __init__(self, value: bytes):
+        self.value = value
+
+    def __lt__(self, other: "_ReverseBytes") -> bool:
+        return self.value > other.value
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, _ReverseBytes):
+            return False
+        return self.value == other.value
+
+
+class BPETrainer:
+    def __init__(
+        self,
+        vocab_counts: dict[tuple[int, ...], int],
+        special_tokens_ids: set[int],
+        merge_workers: int = 1,
+    ):
+        """
+        vocab_counts: 预分词后的词频字典
+        special_tokens_ids: 不参与合并的特殊 token 集合
+        """
+        # 将数据转为可变的 list 结构以便原地修改
+        # self.words: list[list[int]]，存储每个词的 token 序列
+        # self.freqs: list[int]，存储每个词的频率
+        self.words = []
+        self.freqs = []
+        self.special_tokens_ids = special_tokens_ids
+        self.merge_workers = max(1, int(merge_workers))
+
+        for tokens, freq in vocab_counts.items():
+            if not tokens:
+                continue
+            self.words.append(list(tokens))
+            self.freqs.append(freq)
+
+        # 倒排索引: token_id -> set(word_index)
+        # 记录某个 token 出现在了哪些单词(的索引)中
+        self.token_to_word_idxs = collections.defaultdict(set)
+
+        # Pair 统计: (p0, p1) -> count
+        self.stats = collections.defaultdict(int)
+        # Pair -> set(word_index)
+        self.pair_to_word_idxs = collections.defaultdict(set)
+
+        # 堆结构，用于快速取出最高频 pair (lazy deletion)
+        # heap item: (-count, token_bytes_a, token_bytes_b, pair)
+        self.heap = []
+
+        # 初始化索引和统计
+        self._build_index_and_stats()
+
+    def _build_index_and_stats(self):
+        for idx, word in enumerate(self.words):
+            # 建立倒排索引
+            for token in word:
+                self.token_to_word_idxs[token].add(idx)
+            # 统计初始 Pair
+            for i in range(len(word) - 1):
+                pair = (word[i], word[i + 1])
+                if pair[0] in self.special_tokens_ids or pair[1] in self.special_tokens_ids:
+                    continue
+                self.stats[pair] += self.freqs[idx]
+                self.pair_to_word_idxs[pair].add(idx)
+
+    def _iter_word_pairs(self, word: list[int]) -> list[tuple[int, int]]:
+        if len(word) < 2:
+            return []
+        pairs = []
+        for i in range(len(word) - 1):
+            pair = (word[i], word[i + 1])
+            if pair[0] in self.special_tokens_ids or pair[1] in self.special_tokens_ids:
+                continue
+            pairs.append(pair)
+        return pairs
+
+    def build_heap(self, id_to_bytes: dict[int, bytes]) -> None:
+        import heapq
+
+        self.heap.clear()
+        for pair, count in self.stats.items():
+            if count <= 0:
+                continue
+            heapq.heappush(
+                self.heap,
+                (
+                    -count,
+                    _ReverseBytes(id_to_bytes.get(pair[0], b"")),
+                    _ReverseBytes(id_to_bytes.get(pair[1], b"")),
+                    pair,
+                ),
+            )
+
+    def _remove_word_pairs(self, word: list[int], freq: int) -> None:
+        for pair in self._iter_word_pairs(word):
+            self.stats[pair] -= freq
+            if self.stats[pair] == 0:
+                del self.stats[pair]
+
+    def _add_word_pairs(self, word: list[int], freq: int) -> None:
+        for pair in self._iter_word_pairs(word):
+            self.stats[pair] += freq
+
+    def _get_best_pair(self, id_to_bytes):
+        """
+        找到频率最高的 Pair。
+        Tie-breaking: 频率高优先 -> 字节序大优先
+        """
+        import heapq
+
+        if not self.stats:
+            return None
+
+        while self.heap:
+            neg_count, rev_b0, rev_b1, pair = self.heap[0]
+            count = self.stats.get(pair, 0)
+            if count > 0 and -neg_count == count:
+                if rev_b0.value == id_to_bytes.get(pair[0], b"") and rev_b1.value == id_to_bytes.get(pair[1], b""):
+                    return pair
+            heapq.heappop(self.heap)
+
+        return None
+
+    def merge_pair(self, pair, new_token_id, id_to_bytes: dict[int, bytes]):
+        p0, p1 = pair
+        if p0 in self.special_tokens_ids or p1 in self.special_tokens_ids:
+            return
+        import heapq
+        from concurrent.futures import ThreadPoolExecutor
+
+        # 优化：只检查真实包含 (p0, p1) 相邻的单词
+        candidate_idxs = list(self.pair_to_word_idxs.get(pair, set()))
+
+        def _merge_one(idx: int):
+            word = self.words[idx]
+            if len(word) < 2:
+                return None
+            i = 0
+            new_word = []
+            changed = False
+            while i < len(word):
+                if i < len(word) - 1 and word[i] == p0 and word[i + 1] == p1:
+                    new_word.append(new_token_id)
+                    changed = True
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            if not changed:
+                return None
+            return idx, new_word
+
+        changes = []
+        if self.merge_workers > 1 and len(candidate_idxs) > 1:
+            with ThreadPoolExecutor(max_workers=self.merge_workers) as executor:
+                for result in executor.map(_merge_one, candidate_idxs):
+                    if result is not None:
+                        changes.append(result)
+        else:
+            for idx in candidate_idxs:
+                result = _merge_one(idx)
+                if result is not None:
+                    changes.append(result)
+
+        # 执行真正的更新
+        updated_pairs = set()
+
+        for idx, new_word in changes:
+            freq = self.freqs[idx]
+            old_word = self.words[idx]
+
+            # 1. 减去旧统计 (Optimized: 仅减去受影响的部分会更复杂，全量减局部单词其实很快)
+            old_pairs = self._iter_word_pairs(old_word)
+            for old_pair in old_pairs:
+                self.stats[old_pair] -= freq
+                if self.stats[old_pair] == 0:
+                    del self.stats[old_pair]
+                updated_pairs.add(old_pair)
+                self.pair_to_word_idxs[old_pair].discard(idx)
+
+            # 2. 更新单词
+            self.words[idx] = new_word
+
+            # 3. 加上新统计
+            new_pairs = self._iter_word_pairs(new_word)
+            for new_pair in new_pairs:
+                self.stats[new_pair] += freq
+                updated_pairs.add(new_pair)
+                self.pair_to_word_idxs[new_pair].add(idx)
+
+            # 4. 更新倒排索引
+            old_tokens = set(old_word)
+            new_tokens = set(new_word)
+
+            for token in old_tokens - new_tokens:
+                self.token_to_word_idxs[token].discard(idx)
+            for token in new_tokens - old_tokens:
+                self.token_to_word_idxs[token].add(idx)
+
+            self.token_to_word_idxs[new_token_id].add(idx)
+
+        for pair in updated_pairs:
+            count = self.stats.get(pair, 0)
+            if count > 0:
+                heapq.heappush(
+                    self.heap,
+                    (
+                        -count,
+                        _ReverseBytes(id_to_bytes.get(pair[0], b"")),
+                        _ReverseBytes(id_to_bytes.get(pair[1], b"")),
+                        pair,
+                    ),
+                )
+
+
+def train_bpe(
+    input_path: str,
+    vocab_size: int,
+    special_tokens: list[str] | None = None,
+    num_workers: int = 4,
+    merge_workers: int = 1,
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    special_tokens = special_tokens or []
+    split_token = special_tokens[0].encode("utf-8") if special_tokens else b""
+
+    # 1. Pre-tokenization (保留原有的多进程逻辑，这部分效率已经不错)
+    boundaries = find_chunk_boundaries(input_path, num_workers, split_token)
+    chunk_args = []
+    for i in range(len(boundaries) - 1):
+        chunk_args.append((input_path, boundaries[i], boundaries[i + 1], special_tokens))
+
+    global_vocab_counts = collections.Counter()
+    if num_workers > 1 and len(chunk_args) > 1:
+        with multiprocessing.Pool(processes=num_workers) as pool:
+            for local_counts in pool.imap_unordered(_process_chunk_worker, chunk_args):
+                global_vocab_counts.update(local_counts)
+    else:
+        for args in chunk_args:
+            global_vocab_counts.update(_process_chunk_worker(args))
+
+    # 2. 初始化 BPE Trainer
+    special_tokens_ids = {256 + i for i in range(len(special_tokens))}
+    # 原代码中 _process_chunk_worker 已经将特殊 token 映射为 256+ID
+
+    trainer = BPETrainer(global_vocab_counts, special_tokens_ids, merge_workers=merge_workers)
+
+    # 初始化词表
+    vocab = {int(i): bytes([i]) for i in range(0, 256)}
+    merges = []
+
+    # 准备 id_to_bytes 映射，用于 tie-breaking 和输出
+    id_to_bytes = {i: bytes([i]) for i in range(256)}
+
+    # 特殊 token 处理
+    current_token_id = 256
+    for token in special_tokens:
+        token_bytes = token.encode("utf-8")
+        vocab[current_token_id] = token_bytes
+        id_to_bytes[current_token_id] = token_bytes
+        current_token_id += 1
+
+    # 初始化 heap
+    trainer.build_heap(id_to_bytes)
+
+    base_vocab_size = current_token_id
+    target_merges = vocab_size - base_vocab_size
+
+    if target_merges < 0:
+        raise ValueError("vocab_size too small")
+
+    print(f"Starting BPE training. Target merges: {target_merges}")
+
+    # 3. BPE 循环
+    for i in range(target_merges):
+        if i % 100 == 0:
+            print(f"Merge {i}/{target_merges}...")
+
+        # 获取最佳 Pair
+        best_pair = trainer._get_best_pair(id_to_bytes)
+        if best_pair is None:
+            print(f"No more pairs to merge at iteration {i}. Stopping early.")
+            break
+
+        p0, p1 = best_pair
+
+        # 记录 Merge 规则
+        merges.append((id_to_bytes[p0], id_to_bytes[p1]))
+
+        # 更新 id_to_bytes
+        new_token_bytes = id_to_bytes[p0] + id_to_bytes[p1]
+        id_to_bytes[current_token_id] = new_token_bytes
+        vocab[current_token_id] = new_token_bytes
+
+        # 执行合并
+        trainer.merge_pair(best_pair, current_token_id, id_to_bytes)
+
+        current_token_id += 1
+
+    return vocab, merges
