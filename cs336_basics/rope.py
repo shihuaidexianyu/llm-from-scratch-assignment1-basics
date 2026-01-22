@@ -19,6 +19,7 @@ class RotaryPositionalEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq)
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
+        assert x.size(-2) <= self.max_seq_len, "Sequence length exceeds maximum length"
         # x: (Batch, Seq, Dim)
 
         # token_positions: (Batch, Seq)
