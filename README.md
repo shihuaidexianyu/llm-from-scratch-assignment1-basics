@@ -59,3 +59,19 @@ Use `encode_datasets.py` to convert datasets into uint16 token ID arrays.
 uv run encode_datasets.py --dataset tinystories --out-dir data/encoded
 uv run encode_datasets.py --dataset owt --out-dir data/encoded --skip-missing-tokenizer
 ```
+
+## Train TinyStories model
+
+Use `training_together.py` to train a Transformer LM on TinyStories with memmap datasets.
+The script defaults to the pre-encoded TinyStories `.npy` files in `models/` and the
+tokenizer in `models/tinystories_train_tokenizer`.
+
+Key options you may want to override:
+
+- `--train-data`, `--valid-data`: memmap `.npy` token ID files.
+- `--tokenizer-dir`: tokenizer directory to infer vocab size.
+- `--checkpoint-dir`: directory for checkpoints + config.
+- `--resume-from`: resume training from a checkpoint path.
+- `--wandb-project`: enable Weights & Biases logging.
+
+See `uv run training_together.py --help` for the full list of hyperparameters.
