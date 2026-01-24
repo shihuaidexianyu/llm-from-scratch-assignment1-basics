@@ -73,5 +73,6 @@ Key options you may want to override:
 - `--checkpoint-dir`: directory for checkpoints + config.
 - `--resume-from`: resume training from a checkpoint path.
 - `--wandb-project`: enable Weights & Biases logging.
+- `--precision` / `--grad-accum-steps`: reduce GPU memory pressure.
 
 See `uv run training_together.py --help` for the full list of hyperparameters.

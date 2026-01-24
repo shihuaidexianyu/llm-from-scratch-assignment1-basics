@@ -21,9 +21,11 @@ dependencies = [
     "ty>=0.0.1a16",
 ]
 
+# --- 修改开始：将源从 cu130 更改为 cu126 ---
+
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu126"  # 修改了这里
+url = "https://download.pytorch.org/whl/cu126"  # 修改了这里
 explicit = true
 
 [[tool.uv.index]]
@@ -33,11 +35,15 @@ explicit = true
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    # 修改了 index 指向
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
 torchvision = [
-    { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    # 修改了 index 指向
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
+
+# --- 修改结束 ---
 
 [build-system]
 requires = ["uv_build>=0.8.3,<0.9.0"]

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,8 @@ class TrainConfig:
     d_ff: int
     rope_theta: float
     batch_size: int
+    grad_accum_steps: int
+    precision: str
     max_iters: int
     lr: float
     betas: tuple[float, float]
@@ -79,6 +82,19 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--d-ff", type=int, default=2048)
     parser.add_argument("--rope-theta", type=float, default=10000.0)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help="Number of micro-steps to accumulate before optimizer step.",
+    )
+    parser.add_argument(
+        "--precision",
+        type=str,
+        default="fp32",
+        choices=("fp32", "fp16", "bf16"),
+        help="Mixed precision mode (fp32, fp16, bf16).",
+    )
     parser.add_argument("--max-iters", type=int, default=5000)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--beta1", type=float, default=0.9)
@@ -124,6 +140,8 @@ def parse_args() -> TrainConfig:
         d_ff=args.d_ff,
         rope_theta=args.rope_theta,
         batch_size=args.batch_size,
+    grad_accum_steps=args.grad_accum_steps,
+    precision=args.precision,
         max_iters=args.max_iters,
         lr=args.lr,
         betas=(args.beta1, args.beta2),
@@ -171,17 +189,26 @@ def evaluate(
     device: torch.device,
     eval_iters: int,
     vocab_size: int,
+    autocast_context: Any,
 ) -> float:
     model.eval()
     losses: list[float] = []
     with torch.no_grad():
         for _ in range(eval_iters):
             inputs, targets = get_batch(data, batch_size, context_length, device=str(device))
-            logits = model(inputs)
-            loss = cross_entropy(logits.view(-1, vocab_size), targets.view(-1))
+            with autocast_context:
+                logits = model(inputs)
+                loss = cross_entropy(logits.view(-1, vocab_size), targets.view(-1))
             losses.append(loss.item())
     model.train()
     return float(np.mean(losses))
+
+
+def get_autocast_context(device: torch.device, precision: str):
+    if precision == "fp32":
+        return nullcontext()
+    dtype = torch.float16 if precision == "fp16" else torch.bfloat16
+    return torch.autocast(device_type=device.type, dtype=dtype)
 
 
 def maybe_init_wandb(config: TrainConfig) -> Any:
@@ -226,7 +253,10 @@ def main() -> None:
         config.rope_theta,
         device=device,
     )
+    model = model.to(device)
     optimizer = AdamW(model.parameters(), lr=config.lr, betas=config.betas, weight_decay=config.weight_decay)
+    autocast_context = get_autocast_context(device, config.precision)
+    scaler = torch.amp.GradScaler(enabled=(device.type == "cuda" and config.precision == "fp16"))
 
     start_iter = 0
     if config.resume_from:
@@ -240,6 +270,8 @@ def main() -> None:
         "Training config:\n"
         f"  Device: {device}\n"
         f"  Vocab size: {vocab_size}\n"
+        f"  Precision: {config.precision}\n"
+        f"  Grad accum steps: {config.grad_accum_steps}\n"
         f"  Train tokens: {len(train_data):,}\n"
         f"  Valid tokens: {len(valid_data):,}\n"
     )
@@ -248,24 +280,56 @@ def main() -> None:
     last_log_time = time.time()
 
     for step in range(start_iter, config.max_iters):
-        inputs, targets = get_batch(train_data, config.batch_size, config.context_length, device=str(device))
-        logits = model(inputs)
-        loss = cross_entropy(logits.view(-1, vocab_size), targets.view(-1))
+        optimizer.zero_grad(set_to_none=True)
+        accum_loss = 0.0
+        try:
+            for _ in range(config.grad_accum_steps):
+                inputs, targets = get_batch(train_data, config.batch_size, config.context_length, device=str(device))
+                with autocast_context:
+                    logits = model(inputs)
+                    micro_loss = cross_entropy(logits.view(-1, vocab_size), targets.view(-1))
+                accum_loss += micro_loss.item()
+                micro_loss = micro_loss / config.grad_accum_steps
+                if scaler.is_enabled():
+                    scaler.scale(micro_loss).backward()
+                else:
+                    micro_loss.backward()
+        except torch.cuda.OutOfMemoryError as exc:
+            if device.type == "cuda":
+                print(
+                    "CUDA OOM: try reducing --batch-size, increasing --grad-accum-steps, "
+                    "or using --precision bf16/fp16."
+                )
+                torch.cuda.empty_cache()
+            raise exc
 
-        optimizer.zero_grad()
-        loss.backward()
         if config.grad_clip > 0:
+            if scaler.is_enabled():
+                scaler.unscale_(optimizer)
             gradient_clipping(model.parameters(), config.grad_clip)
-        optimizer.step()
+
+        if scaler.is_enabled():
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+
+        avg_loss = accum_loss / config.grad_accum_steps
 
         if (step + 1) % config.log_interval == 0:
             now = time.time()
             step_time = now - last_log_time
-            tokens_per_sec = (config.batch_size * config.context_length * config.log_interval) / max(step_time, 1e-9)
+            tokens_per_sec = (
+                config.batch_size
+                * config.context_length
+                * config.log_interval
+                * config.grad_accum_steps
+                / max(step_time, 1e-9)
+            )
             last_log_time = now
             log_msg = (
                 f"Iter {step + 1}/{config.max_iters} | "
-                f"loss {loss.item():.4f} | "
+                f"loss {avg_loss:.4f} | "
                 f"lr {config.lr:.2e} | "
                 f"tok/s {tokens_per_sec:,.0f}"
             )
@@ -273,7 +337,7 @@ def main() -> None:
             if wandb_run:
                 wandb_run.log(
                     {
-                        "train/loss": loss.item(),
+                        "train/loss": avg_loss,
                         "train/tokens_per_sec": tokens_per_sec,
                         "iteration": step + 1,
                     }
@@ -288,6 +352,7 @@ def main() -> None:
                 device,
                 config.eval_iters,
                 vocab_size,
+                autocast_context,
             )
             print(f"Validation @ {step + 1}: loss {val_loss:.4f}")
             if wandb_run:
