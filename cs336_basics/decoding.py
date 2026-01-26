@@ -127,12 +127,12 @@ if __name__ == "__main__":
     tinystories_inference = Inference(
         vocab_path="models/tinystories_train_tokenizer/bpe_vocab.json",
         merges_path="models/tinystories_train_tokenizer/bpe_merges.txt",
-        model_path="checkpoints/tinystories/checkpoint_2000.pt",
+        model_path="/home/hw/learn/llm-from-scratch-assignment1-basics/checkpoints/tinystories_exp3/checkpoint_10000.pt",
         device="cpu",
     )
     output = tinystories_inference.generate_text(
         prompt="Once upon a time in a land far away,",
-        max_length=1000,
+        max_length=100,
         temperature=0.8,
         top_p=0.9,
     )
