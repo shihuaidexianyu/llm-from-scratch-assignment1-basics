@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import time
 from contextlib import nullcontext
@@ -20,6 +21,50 @@ from cs336_basics.cross_entropy import cross_entropy
 from cs336_basics.data_loading import get_batch
 from cs336_basics.gradient_clipping import gradient_clipping
 from cs336_basics.transformer_lm import Transformer_LM
+from cs336_basics.learning_rate_schedule import learning_rate_schedule
+
+
+# =========================
+# Hard-coded experiment defaults
+# =========================
+DEFAULT_TRAIN_DATA = Path("models/tinystories_train_uint16.npy")
+DEFAULT_VALID_DATA = Path("models/tinystories_valid_uint16.npy")
+DEFAULT_TOKENIZER_DIR = Path("models/tinystories_train_tokenizer")
+DEFAULT_VOCAB_SIZE: int | None = None
+DEFAULT_CONTEXT_LENGTH = 256
+DEFAULT_D_MODEL = 512
+DEFAULT_NUM_LAYERS = 4
+DEFAULT_NUM_HEADS = 16
+DEFAULT_D_FF = 1344
+DEFAULT_ROPE_THETA = 10000.0
+DEFAULT_BATCH_SIZE = 128
+DEFAULT_GRAD_ACCUM_STEPS = 1
+DEFAULT_PRECISION = "fp32"
+DEFAULT_MAX_ITERS = 10000
+DEFAULT_BETA1 = 0.9
+DEFAULT_BETA2 = 0.95
+DEFAULT_WEIGHT_DECAY = 0.01
+DEFAULT_GRAD_CLIP = 1.0
+DEFAULT_LOG_INTERVAL = 50
+DEFAULT_EVAL_INTERVAL = 200
+DEFAULT_EVAL_ITERS = 50
+DEFAULT_SAVE_INTERVAL = 500
+DEFAULT_CHECKPOINT_DIR = Path("checkpoints/tinystories")
+DEFAULT_RESUME_FROM: Path | None = None
+DEFAULT_DEVICE = "auto"
+DEFAULT_SEED = 1337
+DEFAULT_WANDB_PROJECT: str | None = None
+DEFAULT_WANDB_RUN_NAME: str | None = None
+DEFAULT_LOG_FILE = Path("checkpoints/tinystories/loss_log.csv")
+
+DEFAULT_LR = 5e-4
+DEFAULT_BETA1 = 0.9
+DEFAULT_BETA2 = 0.95
+DEFAULT_WEIGHT_DECAY = 0.01
+DEFAULT_WARMUP_ITERS = 1000
+DEFAULT_EPSILON = 1e-8
+DEFAULT_MAX_LR = 8e-5
+DEFAULT_MIN_LR = 3e-5
 
 
 @dataclass
@@ -48,6 +93,7 @@ class TrainConfig:
     save_interval: int
     checkpoint_dir: Path
     resume_from: Path | None
+    log_file: Path
     device: str
     seed: int
     wandb_project: str | None
@@ -59,73 +105,81 @@ def parse_args() -> TrainConfig:
     parser.add_argument(
         "--train-data",
         type=Path,
-        default=Path("models/tinystories_train_uint16.npy"),
+        default=DEFAULT_TRAIN_DATA,
         help="Path to training .npy file (uint16 token IDs).",
     )
     parser.add_argument(
         "--valid-data",
         type=Path,
-        default=Path("models/tinystories_valid_uint16.npy"),
+        default=DEFAULT_VALID_DATA,
         help="Path to validation .npy file (uint16 token IDs).",
     )
     parser.add_argument(
         "--tokenizer-dir",
         type=Path,
-        default=Path("models/tinystories_train_tokenizer"),
+        default=DEFAULT_TOKENIZER_DIR,
         help="Tokenizer directory containing bpe_vocab.json and bpe_merges.txt.",
     )
-    parser.add_argument("--vocab-size", type=int, default=None, help="Override tokenizer vocab size.")
-    parser.add_argument("--context-length", type=int, default=256)
-    parser.add_argument("--d-model", type=int, default=512)
-    parser.add_argument("--num-layers", type=int, default=8)
-    parser.add_argument("--num-heads", type=int, default=8)
-    parser.add_argument("--d-ff", type=int, default=2048)
-    parser.add_argument("--rope-theta", type=float, default=10000.0)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--vocab-size", type=int, default=DEFAULT_VOCAB_SIZE, help="Override tokenizer vocab size.")
+    parser.add_argument("--context-length", type=int, default=DEFAULT_CONTEXT_LENGTH)
+    parser.add_argument("--d-model", type=int, default=DEFAULT_D_MODEL)
+    parser.add_argument("--num-layers", type=int, default=DEFAULT_NUM_LAYERS)
+    parser.add_argument("--num-heads", type=int, default=DEFAULT_NUM_HEADS)
+    parser.add_argument("--d-ff", type=int, default=DEFAULT_D_FF)
+    parser.add_argument("--rope-theta", type=float, default=DEFAULT_ROPE_THETA)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument(
         "--grad-accum-steps",
         type=int,
-        default=1,
+        default=DEFAULT_GRAD_ACCUM_STEPS,
         help="Number of micro-steps to accumulate before optimizer step.",
     )
     parser.add_argument(
         "--precision",
         type=str,
-        default="fp32",
+        default=DEFAULT_PRECISION,
         choices=("fp32", "fp16", "bf16"),
         help="Mixed precision mode (fp32, fp16, bf16).",
     )
-    parser.add_argument("--max-iters", type=int, default=5000)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--beta1", type=float, default=0.9)
-    parser.add_argument("--beta2", type=float, default=0.95)
-    parser.add_argument("--weight-decay", type=float, default=0.01)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--log-interval", type=int, default=50)
-    parser.add_argument("--eval-interval", type=int, default=200)
-    parser.add_argument("--eval-iters", type=int, default=50)
-    parser.add_argument("--save-interval", type=int, default=500)
+    parser.add_argument("--max-iters", type=int, default=DEFAULT_MAX_ITERS)
+    parser.add_argument("--lr", type=float, default=DEFAULT_LR)
+    parser.add_argument("--beta1", type=float, default=DEFAULT_BETA1)
+    parser.add_argument("--beta2", type=float, default=DEFAULT_BETA2)
+    parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
+    parser.add_argument("--grad-clip", type=float, default=DEFAULT_GRAD_CLIP)
+    parser.add_argument("--log-interval", type=int, default=DEFAULT_LOG_INTERVAL)
+    parser.add_argument("--eval-interval", type=int, default=DEFAULT_EVAL_INTERVAL)
+    parser.add_argument("--eval-iters", type=int, default=DEFAULT_EVAL_ITERS)
+    parser.add_argument("--save-interval", type=int, default=DEFAULT_SAVE_INTERVAL)
     parser.add_argument(
         "--checkpoint-dir",
         type=Path,
-        default=Path("checkpoints/tinystories"),
+        default=DEFAULT_CHECKPOINT_DIR,
         help="Directory to store checkpoints and config.",
     )
     parser.add_argument(
         "--resume-from",
         type=Path,
-        default=None,
+        default=DEFAULT_RESUME_FROM,
         help="Optional checkpoint path to resume from.",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=DEFAULT_LOG_FILE,
+        help="CSV log file for loss curves (step, wallclock, train/valid loss).",
     )
     parser.add_argument(
         "--device",
         type=str,
-        default="auto",
+        default=DEFAULT_DEVICE,
         help="Device to use (auto, cpu, cuda).",
     )
-    parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--wandb-project", type=str, default=None, help="Weights & Biases project name.")
-    parser.add_argument("--wandb-run-name", type=str, default=None, help="Weights & Biases run name.")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument(
+        "--wandb-project", type=str, default=DEFAULT_WANDB_PROJECT, help="Weights & Biases project name."
+    )
+    parser.add_argument("--wandb-run-name", type=str, default=DEFAULT_WANDB_RUN_NAME, help="Weights & Biases run name.")
 
     args = parser.parse_args()
     return TrainConfig(
@@ -153,6 +207,7 @@ def parse_args() -> TrainConfig:
         save_interval=args.save_interval,
         checkpoint_dir=args.checkpoint_dir,
         resume_from=args.resume_from,
+        log_file=args.log_file,
         device=args.device,
         seed=args.seed,
         wandb_project=args.wandb_project,
@@ -231,6 +286,36 @@ def save_config(config: TrainConfig) -> None:
         json.dump(asdict(config), f, ensure_ascii=False, indent=2, default=str)
 
 
+def init_loss_log(log_file: Path) -> None:
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    if log_file.exists():
+        return
+    with log_file.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["step", "wallclock_sec", "train_loss", "valid_loss", "tokens_per_sec"])
+
+
+def append_loss_log(
+    log_file: Path,
+    step: int,
+    wallclock_sec: float,
+    train_loss: float | None,
+    valid_loss: float | None,
+    tokens_per_sec: float | None,
+) -> None:
+    with log_file.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                step,
+                f"{wallclock_sec:.4f}",
+                "" if train_loss is None else f"{train_loss:.6f}",
+                "" if valid_loss is None else f"{valid_loss:.6f}",
+                "" if tokens_per_sec is None else f"{tokens_per_sec:.4f}",
+            ]
+        )
+
+
 def main() -> None:
     config = parse_args()
     device = resolve_device(config.device)
@@ -265,6 +350,7 @@ def main() -> None:
 
     save_config(config)
     wandb_run = maybe_init_wandb(config)
+    init_loss_log(config.log_file)
 
     print(
         "Training config:\n"
@@ -277,13 +363,22 @@ def main() -> None:
     )
 
     model.train()
-    last_log_time = time.time()
+    start_time = time.time()
+    last_log_time = start_time
 
     for step in range(start_iter, config.max_iters):
         optimizer.zero_grad(set_to_none=True)
         accum_loss = 0.0
         try:
-            for _ in range(config.grad_accum_steps):
+            for i in range(config.grad_accum_steps):
+                lr = learning_rate_schedule(
+                    step,
+                    config.lr,
+                    DEFAULT_MIN_LR,
+                    DEFAULT_WARMUP_ITERS,
+                    config.max_iters,
+                )
+                optimizer.param_groups[0]["lr"] = lr
                 inputs, targets = get_batch(train_data, config.batch_size, config.context_length, device=str(device))
                 with autocast_context:
                     logits = model(inputs)
@@ -328,12 +423,17 @@ def main() -> None:
             )
             last_log_time = now
             log_msg = (
-                f"Iter {step + 1}/{config.max_iters} | "
-                f"loss {avg_loss:.4f} | "
-                f"lr {config.lr:.2e} | "
-                f"tok/s {tokens_per_sec:,.0f}"
+                f"Iter {step + 1}/{config.max_iters} | loss {avg_loss:.4f} | lr {lr:.2e} | tok/s {tokens_per_sec:,.0f}"
             )
             print(log_msg)
+            append_loss_log(
+                config.log_file,
+                step + 1,
+                now - start_time,
+                avg_loss,
+                None,
+                tokens_per_sec,
+            )
             if wandb_run:
                 wandb_run.log(
                     {
@@ -354,7 +454,16 @@ def main() -> None:
                 vocab_size,
                 autocast_context,
             )
+            now = time.time()
             print(f"Validation @ {step + 1}: loss {val_loss:.4f}")
+            append_loss_log(
+                config.log_file,
+                step + 1,
+                now - start_time,
+                avg_loss,
+                val_loss,
+                None,
+            )
             if wandb_run:
                 wandb_run.log({"valid/loss": val_loss, "iteration": step + 1})
 

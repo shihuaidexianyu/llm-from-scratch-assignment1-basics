@@ -76,3 +76,15 @@ Key options you may want to override:
 - `--precision` / `--grad-accum-steps`: reduce GPU memory pressure.
 
 See `uv run training_together.py --help` for the full list of hyperparameters.
+
+## Plot loss curves
+
+The training script writes a CSV log to `checkpoints/tinystories/loss_log.csv` containing
+step, wallclock seconds, and train/valid loss values. Use the helper script to generate
+a loss curve image:
+
+```sh
+uv run scripts/plot_loss_curve.py \
+	--log-file checkpoints/tinystories/loss_log.csv \
+	--out-file checkpoints/tinystories/loss_curve.png
+```
